@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+memd_env/
+venv/
+.env/
+
+# Data (optional – large files)
+*.csv
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db
