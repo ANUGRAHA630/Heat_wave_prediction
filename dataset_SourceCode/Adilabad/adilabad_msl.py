@@ -1,0 +1,163 @@
+import cdsapi
+import xarray as xr
+import pandas as pd
+import os
+import time
+
+# --- Initialize CDS API Client ---
+client = cdsapi.Client(
+    url="https://cds.climate.copernicus.eu/api",
+    key="18f04497-8219-49a6-aefe-4826e9907662"
+)
+
+# --- Configuration ---
+years = [str(y) for y in range(1979, 2025)]   # 1979–2024
+
+variables = {
+    "msl": "mean_sea_level_pressure",
+    "msnlwrf": "mean_surface_net_long_wave_radiation_flux",
+    "ssrd": "surface_solar_radiation_downwards"
+}
+
+# Output folder for Adilabad
+output_folder = "adilabad_surface_daily_msl_ssrd_msnlwrf_csv"
+os.makedirs(output_folder, exist_ok=True)
+
+# === Helper: Wait for file ===
+def wait_for_file(path, timeout=60):
+    for _ in range(timeout // 3):
+        if os.path.exists(path) and os.path.getsize(path) > 10_000:
+            try:
+                with open(path, "rb"):
+                    return True
+            except PermissionError:
+                time.sleep(3)
+        time.sleep(3)
+    return False
+
+# === Helper: Open NetCDF safely ===
+def safe_open_dataset(path):
+    try:
+        return xr.open_dataset(path, engine="netcdf4")
+    except Exception:
+        try:
+            return xr.open_dataset(path, engine="cfgrib")
+        except Exception:
+            return None
+
+
+all_daily_files = []
+
+# === Main Loop ===
+for year in years:
+    print(f"\n📅 Processing year {year} for Adilabad...")
+    dfs_year = []
+
+    for short, varname in variables.items():
+        filename_hourly = f"adilabad_{short}_{year}.nc"
+        filename_daily = f"adilabad_{short}_daily_{year}.nc"
+        csv_out = os.path.join(
+            output_folder,
+            f"adilabad_{short}_daily_{year}.csv"
+        )
+
+        # 🔹 Adilabad bounding box (±0.5°)
+        # Center: ~19.66°N, 78.53°E
+        request = {
+            "product_type": ["reanalysis"],
+            "variable": [varname],
+            "year": [year],
+            "month": [f"{m:02d}" for m in range(1, 13)],
+            "day": [f"{d:02d}" for d in range(1, 32)],
+            "time": ["00:00", "06:00", "12:00", "18:00"],
+            "data_format": "netcdf",
+            "download_format": "unarchived",
+
+            # [North, West, South, East]
+            "area": [20.16, 78.03, 19.16, 79.03],
+        }
+
+        # --- Step 1: Download with retry ---
+        for attempt in range(3):
+            try:
+                print(f"⬇️  Downloading {varname} for {year} (attempt {attempt+1})...")
+                client.retrieve(
+                    "reanalysis-era5-single-levels",
+                    request
+                ).download(filename_hourly)
+
+                if wait_for_file(filename_hourly):
+                    print(f"✅ Downloaded {filename_hourly}")
+                    break
+                else:
+                    print("⚠️ Incomplete file, retrying...")
+            except Exception as e:
+                print(f"❌ Error downloading {varname}: {e}")
+                time.sleep(5)
+        else:
+            print(f"❌ Skipping {varname} for {year}")
+            continue
+
+        # --- Step 2: Open dataset ---
+        ds = safe_open_dataset(filename_hourly)
+        if ds is None:
+            print(f"⚠️ Skipping {varname} (unreadable file)")
+            continue
+
+        if "valid_time" in ds.coords:
+            ds = ds.rename({"valid_time": "time"})
+
+        # --- Step 3: Spatial averaging ---
+        if "latitude" in ds.dims and "longitude" in ds.dims:
+            ds = ds.mean(dim=["latitude", "longitude"])
+        if "number" in ds.dims:
+            ds = ds.mean(dim="number")
+        if "expver" in ds.dims:
+            ds = ds.mean(dim="expver")
+
+        # --- Step 4: Convert to daily values ---
+        ds_daily = ds.resample(time="1D").mean()
+        ds_daily.to_netcdf(filename_daily)
+
+        # --- Step 5: Save CSV ---
+        df = ds_daily.to_dataframe().reset_index()
+        df.to_csv(csv_out, index=False, float_format="%.4f")
+        print(f"📊 Saved CSV: {csv_out}")
+
+        dfs_year.append(df)
+
+    # --- Step 6: Merge 3 variables per year ---
+    if dfs_year:
+        merged = dfs_year[0]
+        for df in dfs_year[1:]:
+            merged = pd.merge(merged, df, on="time", how="outer")
+
+        yearly_csv = os.path.join(
+            output_folder,
+            f"adilabad_surface_daily_{year}.csv"
+        )
+        merged.to_csv(yearly_csv, index=False, float_format="%.4f")
+        all_daily_files.append(yearly_csv)
+
+        print(f"✅ Combined variables for {year}: {yearly_csv}")
+
+
+# === Step 7: Merge all years ===
+print("\n🔗 Merging all years into final CSV...")
+if all_daily_files:
+    df_all = pd.concat(
+        [pd.read_csv(f) for f in all_daily_files],
+        ignore_index=True
+    )
+
+    merged_csv = os.path.join(
+        output_folder,
+        "adilabad_surface_daily_1979_2024.csv"
+    )
+    df_all.to_csv(merged_csv, index=False, float_format="%.4f")
+
+    print("\n🎉 All years processed successfully for Adilabad!")
+    print(f"📁 Final folder: {os.path.abspath(output_folder)}")
+    print(f"📄 Final CSV: {merged_csv}")
+else:
+    print("❌ No files found to merge.")
